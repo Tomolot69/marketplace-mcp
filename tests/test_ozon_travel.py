@@ -44,6 +44,18 @@ FLIGHT_RESULTS_SNAPSHOT = """
   - button "Выбрать" [e54]
 """
 
+ROUND_TRIP_FLIGHT_SNAPSHOT = """
+- article:
+  - list:
+    - listitem: Самый дешёвый
+  - text: S7 Airlines В пути 1ч 35м 09:30 – 11:05 Прямой Москва, DME – Санкт-Петербург, LED
+  - text: S7 Airlines В пути 1ч 35м 20:40 – 22:15 Прямой Санкт-Петербург, LED – Москва, DME
+  - text: X Без багажа
+  - text: 23 + 4 212 ₽
+  - text: + 106 10 589 ₽ 11 032 ₽
+  - button "Выбрать"
+"""
+
 
 HOTEL_RESULTS_HTML = """
 <html><body>
@@ -135,6 +147,44 @@ def test_flight_snapshot_keeps_offer_boundaries_and_public_price():
     assert results[0].stops == 0
     assert results[1].airlines == ["Аэрофлот"]
     assert results[1].baggage == "not_included"
+
+
+def test_round_trip_url_and_snapshot_keep_both_segments():
+    adapter = OzonTravelAdapter()
+    source_url = adapter.build_flight_url(
+        "MOW",
+        "LED",
+        date(2030, 5, 10),
+        date(2030, 5, 12),
+        adults=1,
+        children=0,
+        infants=0,
+        cabin_class="economy",
+    )
+
+    assert source_url == (
+        "https://www.ozon.ru/travel/flight/search?Children=0&Dlts=1&Infants=0"
+        "&ServiceClass=ECONOMY&dates=d2030-05-10d2030-05-12"
+        "&route=mowledledmow"
+    )
+
+    results = adapter.parse_flight_results(
+        ROUND_TRIP_FLIGHT_SNAPSHOT,
+        source_url=source_url,
+        origin="MOW",
+        destination="LED",
+        departure_date=date(2030, 5, 10),
+        return_date=date(2030, 5, 12),
+    )
+
+    assert len(results) == 1
+    assert results[0].price == 11032.0
+    assert results[0].duration_minutes == 190
+    assert results[0].stops == 0
+    assert results[0].airlines == ["S7 Airlines"]
+    assert [segment.origin for segment in results[0].segments] == ["MOW", "LED"]
+    assert [segment.destination for segment in results[0].segments] == ["LED", "MOW"]
+    assert results[0].segments[1].departure_at == "2030-05-12T20:40:00"
 
 
 def test_flight_camofox_loading_marker_is_polled():

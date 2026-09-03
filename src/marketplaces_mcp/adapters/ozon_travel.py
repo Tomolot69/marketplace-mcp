@@ -325,6 +325,7 @@ class OzonTravelAdapter(BaseAdapter):
         route = f"{origin_iata.lower()}{destination_iata.lower()}"
         dates = f"d{departure_date.isoformat()}"
         if return_date:
+            route += f"{destination_iata.lower()}{origin_iata.lower()}"
             dates += f"d{return_date.isoformat()}"
         return _with_query(
             "https://www.ozon.ru/travel/flight/search",
@@ -385,34 +386,67 @@ class OzonTravelAdapter(BaseAdapter):
         offers: list[FlightOffer] = []
         seen: set[tuple[str, float | None, str | None]] = set()
         for block in _flight_offer_blocks(html, text):
-            times = _TIME_PAIR_RE.search(block)
+            time_pairs = list(_TIME_PAIR_RE.finditer(block))
             money = list(_MONEY_RE.finditer(block))
-            if not times or not money:
+            if not time_pairs or not money:
                 continue
             # Ozon can show baggage add-ons and an Ozon Card discount before
             # the ordinary public fare. The last currency amount in an offer
             # card is the non-conditional price shown next to "Выбрать".
             price = parse_price(money[-1].group(1))
-            duration = _parse_duration_minutes(block)
-            stops = _parse_stops(block)
-            airline = _parse_airline(block)
-            departure_at = f"{departure_date.isoformat()}T{times.group(1)}:00"
-            arrival_at = f"{departure_date.isoformat()}T{times.group(2)}:00"
-            key = (departure_at, price, airline)
+            journey_dates = [departure_date]
+            if return_date is not None:
+                journey_dates.append(return_date)
+            journey_routes = [(origin, destination), (destination, origin)]
+            journey_lines = _flight_journey_lines(block)
+            segments: list[FlightSegment] = []
+            for index, times in enumerate(time_pairs[: len(journey_dates)]):
+                journey_text = (
+                    journey_lines[index]
+                    if index < len(journey_lines)
+                    else block
+                )
+                segment_origin, segment_destination = journey_routes[index]
+                segment_date = journey_dates[index]
+                segments.append(
+                    FlightSegment(
+                        origin=segment_origin,
+                        destination=segment_destination,
+                        departure_at=(
+                            f"{segment_date.isoformat()}T{times.group(1)}:00"
+                        ),
+                        arrival_at=f"{segment_date.isoformat()}T{times.group(2)}:00",
+                        airline=_parse_airline(journey_text),
+                        duration_minutes=_parse_duration_minutes(journey_text),
+                        baggage=_extract_baggage(block),
+                    )
+                )
+            airlines = list(
+                dict.fromkeys(
+                    segment.airline for segment in segments if segment.airline
+                )
+            )
+            departure_at = segments[0].departure_at
+            key = (departure_at, price, "|".join(airlines) or None)
             if key in seen:
                 continue
             seen.add(key)
             baggage = _extract_baggage(block)
             refundable = _bool_from_terms(block, "refund")
             exchangeable = _bool_from_terms(block, "exchange")
-            segment = FlightSegment(
-                origin=origin,
-                destination=destination,
-                departure_at=departure_at,
-                arrival_at=arrival_at,
-                airline=airline,
-                duration_minutes=duration,
-                baggage=baggage,
+            segment_durations = [
+                segment.duration_minutes
+                for segment in segments
+                if segment.duration_minutes is not None
+            ]
+            duration = sum(segment_durations) if segment_durations else None
+            segment_stops = [
+                _parse_stops(line) for line in journey_lines[: len(segments)]
+            ]
+            stops = (
+                sum(item for item in segment_stops if item is not None)
+                if segment_stops and all(item is not None for item in segment_stops)
+                else _parse_stops(block)
             )
             offers.append(
                 FlightOffer(
@@ -422,8 +456,8 @@ class OzonTravelAdapter(BaseAdapter):
                     departure_date=departure_date,
                     return_date=return_date,
                     price=price,
-                    airlines=[airline] if airline else [],
-                    segments=[segment],
+                    airlines=airlines,
+                    segments=segments,
                     stops=stops,
                     duration_minutes=duration,
                     baggage=baggage,
@@ -917,6 +951,15 @@ def _parse_airline(block: str) -> str | None:
         flags=re.IGNORECASE,
     )
     return known.group(1) if known else None
+
+
+def _flight_journey_lines(block: str) -> list[str]:
+    """Return one compact source line for each outbound/return journey."""
+    return [
+        re.sub(r"\s+", " ", line).strip()
+        for line in block.splitlines()
+        if _TIME_PAIR_RE.search(line) and re.search(r"\bВ пути\b", line)
+    ]
 
 
 def _parse_duration_minutes(text: str) -> int | None:
