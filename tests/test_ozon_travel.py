@@ -53,6 +53,7 @@ HOTEL_DETAILS_SNAPSHOT = """
 - heading "Стандарт с двуспальной кроватью" [level=2]
 - text: 9 200 ₽
 - text: Завтрак включён Бесплатная отмена до 8 мая Оплата сейчас Остался 1 вариант
+- text: Другой тариф: нет мест
 - heading "Люкс с видом на море" [level=2]
 - text: 14 000 ₽
 - text: Без питания Невозвратный тариф Оплата сейчас
@@ -145,6 +146,7 @@ def test_hotel_details_extracts_dated_rates_and_lowest_total():
     assert hotel.nights == 2
     assert hotel.total_price == 9200.0
     assert hotel.nightly_price == 4600.0
+    assert hotel.availability == "available"
     assert len(hotel.rates) == 2
     assert hotel.rates[0].price_per_night == 4600.0
     assert hotel.rates[0].meal_plan is not None

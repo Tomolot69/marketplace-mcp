@@ -1117,10 +1117,10 @@ def _parse_hotel_location(text: str, destination: str) -> tuple[str | None, str 
 
 
 def _parse_availability(text: str, has_prices: bool) -> str | None:
-    if re.search(r"нет свободных|нет мест|распродано", text, flags=re.IGNORECASE):
-        return "unavailable"
     if has_prices:
         return "available"
+    if re.search(r"нет свободных|нет мест|распродано", text, flags=re.IGNORECASE):
+        return "unavailable"
     return None
 
 
