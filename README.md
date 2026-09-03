@@ -3,7 +3,8 @@
 Read in Russian: [readme_rus.md](readme_rus.md)
 
 Marketplace MCP is a read-only MCP server for product search, review sampling,
-and price comparison across Ozon, Wildberries, Yandex Market, and Avito.
+and price comparison across Ozon, Wildberries, Yandex Market, and Avito. It also
+searches public Ozon Travel flight and hotel offers for explicit travel dates.
 
 It is built for agents that need marketplace data without logging in, touching carts, or automating checkout. The server returns normalized product data, comparison groups, warnings, and source URLs. When a marketplace blocks scraping or shows anti-bot behavior, the tool reports that instead of trying to bypass it.
 
@@ -20,11 +21,23 @@ It is built for agents that need marketplace data without logging in, touching c
 - `marketplaces_product_reviews` returns a compact review sample for supported
   marketplaces.
 - `marketplaces_get_artifact` reads a saved result artifact.
+- `ozon_travel_flights_search` searches Ozon Travel flights by route, dates,
+  passengers, cabin class, direct-flight preference, and sort order.
+- `ozon_travel_hotels_search` searches Ozon Travel hotels by destination, stay
+  dates, guests, rooms, rating, stars, and maximum total stay price.
+- `ozon_travel_hotel_details` reads room rates for one Ozon Travel hotel URL and
+  the requested stay dates.
 
 Returned product fields include marketplace, title, URL, image URL, price, old
 price, currency, rating, review count, availability, delivery notes, seller
 evidence, used-item condition and location, scraped timestamp, and warnings when
 data is partial.
+
+Flight offers keep segments, airlines, stops, duration, baggage evidence, and
+the displayed total price. Hotel results deliberately keep `nightly_price` and
+`total_price` separate. A search-card “from” price is never silently presented
+as the exact total for the requested stay; use hotel details/rates when an exact
+dated total is required.
 
 ## Safety model
 
@@ -41,6 +54,8 @@ By default it does not:
 - bypass CAPTCHA or anti-bot systems.
 
 Prices are scraped snapshots. Always open the product URL before making a purchase decision.
+Travel availability and prices are also snapshots and must be rechecked before
+booking. The server never reserves or books a flight or hotel.
 
 Marketplace MCP uses Hive Web as the default page loader (`MARKETPLACES_WEB_BACKEND=hive_web`).
 `legacy` mode keeps the previous Playwright/httpx loading stack.
@@ -95,6 +110,11 @@ Per-marketplace proxy values are only applied to that marketplace. When a proxy 
 
 Ozon is rendered with JavaScript enabled. When an Ozon proxy is configured, the Ozon adapter keeps Playwright headful even if `browser_headless` is true, because Ozon is stricter in headless mode. Disabling JavaScript is not a useful fallback: Ozon returns an anti-bot challenge asking the browser to enable JavaScript, and the adapter reports it as `CAPTCHA_OR_BLOCKED`.
 
+Ozon Travel uses the Ozon proxy setting by default. Search-index fallback can
+discover canonical flight or hotel links, but it returns no invented price and
+adds `INDEX_DISCOVERY_ONLY`, `PRICE_UNVERIFIED`, and, for hotels,
+`DATE_AVAILABILITY_UNVERIFIED`.
+
 ## Requirements
 
 - Python 3.11+
@@ -133,7 +153,17 @@ Run one explicit Avito canary without touching retail marketplaces:
 uv run python scripts/live_canary.py --avito-only --avito-query "кроватка Stokke"
 ```
 
-Live search depends on current marketplace behavior. Ozon and Yandex Market may rate-limit, block, or change page markup. In that case the smoke test should return warnings such as `CAPTCHA_OR_BLOCKED` instead of crashing.
+Run explicit read-only Ozon Travel canaries:
+
+```bash
+uv run python scripts/smoke-travel.py flights MOW LED 2030-05-10
+uv run python scripts/smoke-travel.py hotels "Сочи" 2030-05-10 2030-05-12
+```
+
+Live search depends on current marketplace behavior. Ozon, Ozon Travel, and
+Yandex Market may rate-limit, block, or change page markup. In that case the
+smoke test should return warnings such as `CAPTCHA_OR_BLOCKED` instead of
+crashing or fabricating current prices.
 
 ## Hermes setup
 

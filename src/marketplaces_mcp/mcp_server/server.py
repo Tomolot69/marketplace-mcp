@@ -1,14 +1,29 @@
 from __future__ import annotations
 
+from datetime import date
+
 from mcp.server.fastmcp import FastMCP
 
-from marketplaces_mcp.adapters import AvitoAdapter, OzonAdapter, WildberriesAdapter, YandexMarketAdapter
+from marketplaces_mcp.adapters import (
+    AvitoAdapter,
+    OzonAdapter,
+    OzonTravelAdapter,
+    WildberriesAdapter,
+    YandexMarketAdapter,
+)
 from marketplaces_mcp.core.artifacts import create_artifact, read_artifact
 from marketplaces_mcp.core.config import get_settings
 from marketplaces_mcp.core.matching import group_product_results
-from marketplaces_mcp.core.models import CompareResponse, OfferGroup, ProductResult, ReviewsResponse, SearchResponse
+from marketplaces_mcp.core.models import (
+    CompareResponse,
+    FlightSearchResponse,
+    HotelSearchResponse,
+    OfferGroup,
+    ProductResult,
+    ReviewsResponse,
+    SearchResponse,
+)
 from marketplaces_mcp.core.reviews import fetch_reviews
-
 
 REQUIRED_TOOLS = [
     "marketplaces_search",
@@ -20,6 +35,9 @@ REQUIRED_TOOLS = [
     "marketplaces_product_details",
     "marketplaces_product_reviews",
     "marketplaces_get_artifact",
+    "ozon_travel_flights_search",
+    "ozon_travel_hotels_search",
+    "ozon_travel_hotel_details",
 ]
 
 
@@ -32,6 +50,7 @@ _adapters = {
     "avito": AvitoAdapter(_settings),
 }
 _default_marketplaces = ["ozon", "wildberries", "yandex_market"]
+_travel_adapter = OzonTravelAdapter(_settings)
 
 
 def _as_marketplace_list(raw: list[str] | None) -> list[str]:
@@ -77,21 +96,25 @@ async def marketplaces_search(
         warnings=sorted(set(warnings)),
         tokens_estimate=_estimate_tokens(query, len(all_results)),
     )
-    response.artifact_id = create_artifact({
-        "type": "search",
-        "query": query,
-        "marketplaces": marketplaces,
-        "search_urls": used_urls,
-        "strategy": strategy,
-        "results": [item.model_dump() for item in response.results],
-    })
+    response.artifact_id = create_artifact(
+        {
+            "type": "search",
+            "query": query,
+            "marketplaces": marketplaces,
+            "search_urls": used_urls,
+            "strategy": strategy,
+            "results": [item.model_dump() for item in response.results],
+        }
+    )
 
     return response
 
 
 @mcp.tool()
 async def ozon_search(query: str, limit: int = 10, strategy: str = "auto"):
-    results, warnings, search_url = await _adapters["ozon"].search(query=query, limit=limit, strategy=strategy)
+    results, warnings, search_url = await _adapters["ozon"].search(
+        query=query, limit=limit, strategy=strategy
+    )
     response = SearchResponse(
         query=query,
         marketplaces=["ozon"],
@@ -184,6 +207,185 @@ async def avito_search(query: str, limit: int = 10, strategy: str = "auto"):
             "search_urls": [search_url],
             "strategy": strategy,
             "results": [item.model_dump() for item in response.results],
+        }
+    )
+    return response
+
+
+@mcp.tool()
+async def ozon_travel_flights_search(
+    origin: str,
+    destination: str,
+    departure_date: str,
+    return_date: str | None = None,
+    adults: int = 1,
+    children: int = 0,
+    infants: int = 0,
+    cabin_class: str = "economy",
+    direct_only: bool = False,
+    sort: str = "price",
+    limit: int = 10,
+    strategy: str = "auto",
+):
+    """Search public Ozon Travel flight offers without booking or account actions."""
+    results, warnings, source_url = await _travel_adapter.search_flights(
+        origin,
+        destination,
+        departure_date,
+        return_date,
+        adults=adults,
+        children=children,
+        infants=infants,
+        cabin_class=cabin_class,
+        direct_only=direct_only,
+        sort=sort,
+        limit=limit,
+        strategy=strategy,
+    )
+    response = FlightSearchResponse(
+        origin=origin,
+        destination=destination,
+        departure_date=_safe_date(departure_date),
+        return_date=_safe_date(return_date),
+        adults=adults,
+        children=children,
+        infants=infants,
+        cabin_class=cabin_class,
+        results=results,
+        warnings=warnings,
+        source_url=source_url,
+    )
+    response.artifact_id = create_artifact(
+        {
+            "type": "ozon_travel_flight_search",
+            "origin": origin,
+            "destination": destination,
+            "departure_date": departure_date,
+            "return_date": return_date,
+            "passengers": {"adults": adults, "children": children, "infants": infants},
+            "cabin_class": cabin_class,
+            "direct_only": direct_only,
+            "sort": sort,
+            "strategy": strategy,
+            "source_url": source_url,
+            "warnings": warnings,
+            "results": [item.model_dump(mode="json") for item in results],
+        }
+    )
+    return response
+
+
+@mcp.tool()
+async def ozon_travel_hotels_search(
+    destination: str,
+    check_in: str,
+    check_out: str,
+    adults: int = 2,
+    rooms: int = 1,
+    min_rating: float | None = None,
+    stars: list[int] | None = None,
+    max_total_price: float | None = None,
+    sort: str = "price",
+    include_rates: bool = True,
+    limit: int = 10,
+    strategy: str = "auto",
+):
+    """Search public Ozon Travel hotels for exact stay dates and guest count."""
+    results, warnings, source_url = await _travel_adapter.search_hotels(
+        destination,
+        check_in,
+        check_out,
+        adults=adults,
+        rooms=rooms,
+        min_rating=min_rating,
+        stars=stars,
+        max_total_price=max_total_price,
+        sort=sort,
+        include_rates=include_rates,
+        limit=limit,
+        strategy=strategy,
+    )
+    parsed_check_in = _safe_date(check_in)
+    parsed_check_out = _safe_date(check_out)
+    response = HotelSearchResponse(
+        destination=destination,
+        check_in=parsed_check_in,
+        check_out=parsed_check_out,
+        nights=_stay_nights(parsed_check_in, parsed_check_out),
+        adults=adults,
+        rooms=rooms,
+        results=results,
+        warnings=warnings,
+        source_url=source_url,
+    )
+    response.artifact_id = create_artifact(
+        {
+            "type": "ozon_travel_hotel_search",
+            "destination": destination,
+            "check_in": check_in,
+            "check_out": check_out,
+            "adults": adults,
+            "rooms": rooms,
+            "filters": {
+                "min_rating": min_rating,
+                "stars": stars,
+                "max_total_price": max_total_price,
+                "sort": sort,
+            },
+            "strategy": strategy,
+            "source_url": source_url,
+            "warnings": warnings,
+            "results": [item.model_dump(mode="json") for item in results],
+        }
+    )
+    return response
+
+
+@mcp.tool()
+async def ozon_travel_hotel_details(
+    url: str,
+    destination: str,
+    check_in: str,
+    check_out: str,
+    adults: int = 2,
+    rooms: int = 1,
+    strategy: str = "auto",
+):
+    """Read one public Ozon Travel hotel page with rates for exact dates."""
+    hotel, warnings = await _travel_adapter.hotel_details(
+        url,
+        destination=destination,
+        check_in=check_in,
+        check_out=check_out,
+        adults=adults,
+        rooms=rooms,
+        strategy=strategy,
+    )
+    parsed_check_in = _safe_date(check_in)
+    parsed_check_out = _safe_date(check_out)
+    response = HotelSearchResponse(
+        destination=destination,
+        check_in=parsed_check_in,
+        check_out=parsed_check_out,
+        nights=_stay_nights(parsed_check_in, parsed_check_out),
+        adults=adults,
+        rooms=rooms,
+        results=[hotel] if hotel else [],
+        warnings=warnings,
+        source_url=url,
+    )
+    response.artifact_id = create_artifact(
+        {
+            "type": "ozon_travel_hotel_details",
+            "url": url,
+            "destination": destination,
+            "check_in": check_in,
+            "check_out": check_out,
+            "adults": adults,
+            "rooms": rooms,
+            "strategy": strategy,
+            "warnings": warnings,
+            "result": hotel.model_dump(mode="json") if hotel else None,
         }
     )
     return response
@@ -352,6 +554,22 @@ def _detect_marketplace(url: str) -> str:
 
 def _estimate_tokens(query: str, results_count: int) -> int:
     return len(query) + results_count * 15
+
+
+def _safe_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _stay_nights(check_in: date | None, check_out: date | None) -> int | None:
+    if check_in is None or check_out is None:
+        return None
+    nights = (check_out - check_in).days
+    return nights if nights > 0 else None
 
 
 def main() -> None:
