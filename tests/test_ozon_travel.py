@@ -59,6 +59,19 @@ HOTEL_DETAILS_SNAPSHOT = """
 """
 
 
+HOTEL_DETAILS_WITH_NEARBY_PRICES = """
+- heading "Отель Гарден Хиллс by Provence, 3*" [level=1]
+- text: Ближайшие доступные даты 3 – 5 октября от 3 100 ₽ Ваши даты 10 – 12 октября от 4 840 ₽
+- heading "Эконом двухместный" [level=2]
+- text: Двуспальная кровать
+- text: от 4 142 ₽ 10 – 12 октября, 2 ночи
+- text: 2 гостя
+Похожие отели и квартиры рядом на 10 – 12 октября
+- text: 2 000 ₽
+- link "Чужой соседний отель"
+"""
+
+
 def test_flight_fixture_parsing_and_sorting():
     async def run():
         return await OzonTravelAdapter().search_flights(
@@ -138,6 +151,21 @@ def test_hotel_details_extracts_dated_rates_and_lowest_total():
     assert hotel.rates[0].meal_plan.startswith("Завтрак включён")
     assert hotel.rates[0].refundable is True
     assert hotel.rates[1].refundable is False
+
+
+def test_hotel_details_excludes_nearby_hotels_and_date_carousel_prices():
+    hotel = OzonTravelAdapter().parse_hotel_details(
+        HOTEL_DETAILS_WITH_NEARBY_PRICES,
+        url="https://www.ozon.ru/travel/hotels/product/garden-hills-1001/",
+        destination="Сочи",
+        check_in=date(2030, 10, 10),
+        check_out=date(2030, 10, 12),
+    )
+
+    assert hotel is not None
+    assert hotel.total_price == 4142.0
+    assert len(hotel.rates) == 1
+    assert hotel.rates[0].room_name == "Двуспальная кровать"
 
 
 def test_travel_request_validation_is_structured():

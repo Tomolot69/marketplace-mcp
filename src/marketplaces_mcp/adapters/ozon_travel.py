@@ -974,8 +974,17 @@ def _hotel_candidates_from_snapshot(
 
 
 def _parse_hotel_rates(text: str, nights: int) -> list[HotelRate]:
+    current_hotel_text = re.split(
+        r"Похожие\s+(?:отели|гостиницы|варианты)",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
     lines = [
-        re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()
+        re.sub(r"\s+", " ", line).strip()
+        for line in current_hotel_text.splitlines()
+        if line.strip()
+        and not re.search(r"Ближайшие доступные даты", line, re.IGNORECASE)
     ]
     rates: list[HotelRate] = []
     seen: set[tuple[str | None, float | None]] = set()
@@ -984,13 +993,14 @@ def _parse_hotel_rates(text: str, nights: int) -> list[HotelRate]:
         if not money:
             continue
         price = parse_price(money.group(1))
-        start = max(0, index - 1)
+        start = max(0, index - 12)
+        context_start = max(0, index - 1)
         end = min(len(lines), index + 5)
         for next_index in range(index + 1, end):
             if _MONEY_RE.search(lines[next_index]):
                 end = next_index
                 break
-        context_lines = lines[start:end]
+        context_lines = lines[context_start:end]
         context = " ".join(context_lines)
         room_name = next(
             (
@@ -998,8 +1008,12 @@ def _parse_hotel_rates(text: str, nights: int) -> list[HotelRate]:
                 for candidate in reversed(lines[start:index])
                 if not _MONEY_RE.search(candidate)
                 and not re.search(
-                    r"выбрать|подробнее|рейтинг|отзыв", candidate, re.IGNORECASE
+                    r"выбрать|подробнее|рейтинг|отзыв|ближайшие даты|ваши даты",
+                    candidate,
+                    re.IGNORECASE,
                 )
+                and not re.fullmatch(r"(?:-\s*)?img(?:\s+.*)?|\[e\d+\]:?", candidate)
+                and "/url:" not in candidate
                 and 3 <= len(candidate) <= 180
             ),
             None,
