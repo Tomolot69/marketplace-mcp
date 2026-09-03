@@ -554,7 +554,7 @@ class OzonTravelAdapter(BaseAdapter):
             rates=rates,
             availability=availability,
             confidence=0.9 if total_price is not None else 0.7,
-            raw={"evidence": text[:10000]},
+            raw={"evidence": text[:3000]},
         )
 
     async def _load_travel_page(
@@ -995,6 +995,12 @@ def _parse_hotel_rates(text: str, nights: int) -> list[HotelRate]:
         price = parse_price(money.group(1))
         start = max(0, index - 12)
         context_start = max(0, index - 1)
+        room_name = None
+        for candidate_index in range(index - 1, start - 1, -1):
+            room_name = _room_name_candidate(lines[candidate_index])
+            if room_name:
+                context_start = candidate_index
+                break
         end = min(len(lines), index + 5)
         for next_index in range(index + 1, end):
             if _MONEY_RE.search(lines[next_index]):
@@ -1002,22 +1008,6 @@ def _parse_hotel_rates(text: str, nights: int) -> list[HotelRate]:
                 break
         context_lines = lines[context_start:end]
         context = " ".join(context_lines)
-        room_name = next(
-            (
-                candidate.strip('"')
-                for candidate in reversed(lines[start:index])
-                if not _MONEY_RE.search(candidate)
-                and not re.search(
-                    r"выбрать|подробнее|рейтинг|отзыв|ближайшие даты|ваши даты",
-                    candidate,
-                    re.IGNORECASE,
-                )
-                and not re.fullmatch(r"(?:-\s*)?img(?:\s+.*)?|\[e\d+\]:?", candidate)
-                and "/url:" not in candidate
-                and 3 <= len(candidate) <= 180
-            ),
-            None,
-        )
         key = (room_name, price)
         if key in seen:
             continue
@@ -1051,6 +1041,31 @@ def _parse_hotel_rates(text: str, nights: int) -> list[HotelRate]:
         if len(rates) >= 30:
             break
     return rates
+
+
+def _room_name_candidate(value: str) -> str | None:
+    candidate = value.strip().strip('"')
+    labelled = re.search(r'(?:heading|img)\s+"([^"\n]+)', candidate, re.IGNORECASE)
+    if labelled:
+        candidate = labelled.group(1).strip()
+    else:
+        candidate = re.sub(r"^-\s*(?:text:\s*)?", "", candidate).strip()
+    candidate = re.sub(r"\s*\[e\d+\](?::)?$", "", candidate).strip(' "')
+    if (
+        not 3 <= len(candidate) <= 180
+        or _MONEY_RE.search(candidate)
+        or "/url:" in candidate
+        or re.search(
+            r"выбрать|подробнее|рейтинг|отзыв|ближайшие даты|ваши даты|"
+            r"отмен|оплат|питани|завтрак|\bгост(?:ь|я|ей)|\bноч|\bкомнат|"
+            r"кроват|ванн|кондиционер|wi-fi|вид на|показать|начислим|\bмил|услуг",
+            candidate,
+            re.IGNORECASE,
+        )
+        or re.fullmatch(r"(?:-\s*)?img|\[e\d+\]:?", candidate)
+    ):
+        return None
+    return candidate
 
 
 def _first_match(text: str, pattern: str) -> str | None:

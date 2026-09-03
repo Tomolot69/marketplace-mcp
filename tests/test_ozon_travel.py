@@ -165,7 +165,7 @@ def test_hotel_details_excludes_nearby_hotels_and_date_carousel_prices():
     assert hotel is not None
     assert hotel.total_price == 4142.0
     assert len(hotel.rates) == 1
-    assert hotel.rates[0].room_name == "Двуспальная кровать"
+    assert hotel.rates[0].room_name == "Эконом двухместный"
 
 
 def test_travel_request_validation_is_structured():
