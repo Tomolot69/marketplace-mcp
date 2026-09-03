@@ -74,6 +74,10 @@ class OzonTravelAdapter(BaseAdapter):
 
     marketplace = "ozon_travel"
     camofox_wait_seconds = 3.0
+    camofox_snapshot_attempts = 6
+
+    def _camofox_snapshot_pending(self, snapshot: str) -> bool:
+        return "Получаем расписание рейсов" in snapshot
 
     async def search_flights(
         self,
@@ -323,12 +327,14 @@ class OzonTravelAdapter(BaseAdapter):
         if return_date:
             dates += f"d{return_date.isoformat()}"
         return _with_query(
-            f"https://www.ozon.ru/travel/flight/search/{route}/{dates}",
+            "https://www.ozon.ru/travel/flight/search",
             {
-                "adults": adults,
-                "children": children,
-                "infants": infants,
-                "serviceClass": cabin_class,
+                "Children": children,
+                "Dlts": adults,
+                "Infants": infants,
+                "ServiceClass": cabin_class.upper(),
+                "dates": dates,
+                "route": route,
             },
         )
 
@@ -378,12 +384,15 @@ class OzonTravelAdapter(BaseAdapter):
         text = _visible_text(html)
         offers: list[FlightOffer] = []
         seen: set[tuple[str, float | None, str | None]] = set()
-        for block in _flight_blocks(text):
+        for block in _flight_offer_blocks(html, text):
             times = _TIME_PAIR_RE.search(block)
-            money = _MONEY_RE.search(block)
+            money = list(_MONEY_RE.finditer(block))
             if not times or not money:
                 continue
-            price = parse_price(money.group(1))
+            # Ozon can show baggage add-ons and an Ozon Card discount before
+            # the ordinary public fare. The last currency amount in an offer
+            # card is the non-conditional price shown next to "Выбрать".
+            price = parse_price(money[-1].group(1))
             duration = _parse_duration_minutes(block)
             stops = _parse_stops(block)
             airline = _parse_airline(block)
@@ -865,7 +874,34 @@ def _flight_blocks(text: str) -> list[str]:
     return blocks
 
 
+def _flight_offer_blocks(source: str, visible_text: str) -> list[str]:
+    """Keep one flight card per block when page structure is available."""
+    if re.search(r"^\s*- article:\s*$", source, flags=re.MULTILINE):
+        blocks = []
+        for raw in re.split(r"^\s*- article:\s*$", source, flags=re.MULTILINE)[1:]:
+            block = _visible_text(raw)
+            if _TIME_PAIR_RE.search(block) and _MONEY_RE.search(block):
+                blocks.append(block)
+        if blocks:
+            return blocks
+
+    soup = BeautifulSoup(source, "html.parser")
+    blocks = []
+    for article in soup.find_all("article"):
+        block = _visible_text(str(article))
+        if _TIME_PAIR_RE.search(block) and _MONEY_RE.search(block):
+            blocks.append(block)
+    return blocks or _flight_blocks(visible_text)
+
+
 def _parse_airline(block: str) -> str | None:
+    journey_line = re.search(r"(?mi)^(.{1,100}?)\s+В пути\b", block)
+    if journey_line:
+        airline = re.split(
+            r",\s*рейс выполняет\b", journey_line.group(1), maxsplit=1, flags=re.IGNORECASE
+        )[0].strip(" •|-")
+        if airline:
+            return airline
     before_time = _TIME_PAIR_RE.split(block, maxsplit=1)[0]
     parts = [
         part.strip(" •|-") for part in re.split(r"[\n•|]", before_time) if part.strip()

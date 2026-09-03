@@ -27,6 +27,24 @@ FLIGHT_RESULTS_HTML = """
 """
 
 
+FLIGHT_RESULTS_SNAPSHOT = """
+- article:
+  - list:
+    - listitem: Самый дешёвый
+  - text: S7 Airlines В пути 1ч 35м 09:30 – 11:05 Прямой Москва, DME – Санкт-Петербург, LED
+  - button "Детали перелета" [e47]
+  - text: 23 + 1 959 ₽
+  - text: + 52 5 168 ₽ 5 441 ₽
+  - button "Выбрать" [e48]
+- article:
+  - text: Аэрофлот, рейс выполняет Россия В пути 1ч 30м 11:30 – 13:00 Прямой Москва, VKO – Санкт-Петербург, LED
+  - button "Детали перелета" [e53]
+  - text: Без багажа
+  - text: + 61 6 131 ₽ 6 191 ₽
+  - button "Выбрать" [e54]
+"""
+
+
 HOTEL_RESULTS_HTML = """
 <html><body>
   <article>
@@ -88,8 +106,9 @@ def test_flight_fixture_parsing_and_sorting():
     results, warnings, source_url = asyncio.run(run())
 
     assert warnings == []
-    assert source_url.startswith(
-        "https://www.ozon.ru/travel/flight/search/mowled/d2030-05-10"
+    assert source_url == (
+        "https://www.ozon.ru/travel/flight/search?Children=0&Dlts=2&Infants=0"
+        "&ServiceClass=ECONOMY&dates=d2030-05-10&route=mowled"
     )
     assert [item.price for item in results] == [2679.0, 4120.0]
     assert results[0].origin == "MOW"
@@ -98,6 +117,32 @@ def test_flight_fixture_parsing_and_sorting():
     assert results[0].duration_minutes == 90
     assert results[0].baggage == "not_included"
     assert results[1].baggage == "Багаж 23 кг"
+
+
+def test_flight_snapshot_keeps_offer_boundaries_and_public_price():
+    results = OzonTravelAdapter().parse_flight_results(
+        FLIGHT_RESULTS_SNAPSHOT,
+        source_url="https://www.ozon.ru/travel/flight/search?route=mowled",
+        origin="MOW",
+        destination="LED",
+        departure_date=date(2030, 5, 10),
+        return_date=None,
+    )
+
+    assert [item.price for item in results] == [5441.0, 6191.0]
+    assert results[0].airlines == ["S7 Airlines"]
+    assert results[0].duration_minutes == 95
+    assert results[0].stops == 0
+    assert results[1].airlines == ["Аэрофлот"]
+    assert results[1].baggage == "not_included"
+
+
+def test_flight_camofox_loading_marker_is_polled():
+    adapter = OzonTravelAdapter()
+
+    assert adapter.camofox_snapshot_attempts == 6
+    assert adapter._camofox_snapshot_pending("- paragraph: Получаем расписание рейсов")
+    assert not adapter._camofox_snapshot_pending("- article:\n  - text: S7 Airlines")
 
 
 def test_hotel_search_keeps_nightly_and_total_prices_separate():

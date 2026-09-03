@@ -85,6 +85,7 @@ class BaseAdapter(ABC):
     discovery_domain: str = ""
     product_url_patterns: tuple[str, ...] = ()
     camofox_wait_seconds: float = 1.5
+    camofox_snapshot_attempts: int = 1
 
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
@@ -271,17 +272,32 @@ class BaseAdapter(ABC):
                 tab_id = str(created.json().get("tabId") or "")
                 if not tab_id:
                     return None
-                # Tab creation returns before some client-rendered product pages
-                # have populated their accessibility tree.
-                await anyio.sleep(self.camofox_wait_seconds)
-                response = await client.get(f"/tabs/{tab_id}/snapshot", params={"userId": user_id})
-                response.raise_for_status()
-                return str(response.json().get("snapshot") or "") or None
+                # Tab creation returns before some client-rendered pages have
+                # populated their accessibility tree. Adapters with a known
+                # loading marker can opt into bounded polling while preserving
+                # the same anonymous, short-lived browser session.
+                snapshot: str | None = None
+                attempts = max(int(self.camofox_snapshot_attempts), 1)
+                for attempt in range(attempts):
+                    await anyio.sleep(self.camofox_wait_seconds)
+                    response = await client.get(
+                        f"/tabs/{tab_id}/snapshot", params={"userId": user_id}
+                    )
+                    response.raise_for_status()
+                    snapshot = str(response.json().get("snapshot") or "") or None
+                    if not snapshot or not self._camofox_snapshot_pending(snapshot):
+                        break
+                    if attempt == attempts - 1:
+                        break
+                return snapshot
             finally:
                 try:
                     await client.delete(f"/sessions/{user_id}")
                 except Exception:
                     pass
+
+    def _camofox_snapshot_pending(self, snapshot: str) -> bool:
+        return False
 
     async def _search_with_camofox(
         self,
