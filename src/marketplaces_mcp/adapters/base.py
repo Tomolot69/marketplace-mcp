@@ -86,6 +86,7 @@ class BaseAdapter(ABC):
     product_url_patterns: tuple[str, ...] = ()
     camofox_wait_seconds: float = 1.5
     camofox_snapshot_attempts: int = 1
+    camofox_reuse_anonymous_session: bool = False
 
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
@@ -259,7 +260,7 @@ class BaseAdapter(ABC):
     async def _fetch_with_camofox(self, url: str) -> str | None:
         if not self.settings.camofox_url:
             return None
-        user_id = f"marketplaces-public-{uuid.uuid4().hex[:12]}"
+        user_id = self._camofox_user_id()
         tab_id: str | None = None
         timeout = httpx.Timeout(max(self.settings.request_timeout, 90.0))
         async with httpx.AsyncClient(base_url=self.settings.camofox_url, timeout=timeout) as client:
@@ -285,19 +286,29 @@ class BaseAdapter(ABC):
                     )
                     response.raise_for_status()
                     snapshot = str(response.json().get("snapshot") or "") or None
-                    if not snapshot or not self._camofox_snapshot_pending(snapshot):
+                    if snapshot and not self._camofox_snapshot_pending(snapshot):
                         break
                     if attempt == attempts - 1:
                         break
                 return snapshot
             finally:
-                try:
-                    await client.delete(f"/sessions/{user_id}")
-                except Exception:
-                    pass
+                # A cancelled MCP call must still close its anonymous session.
+                # Bound cleanup so an unavailable browser cannot delay cancellation.
+                with anyio.move_on_after(5, shield=True):
+                    try:
+                        if self.camofox_reuse_anonymous_session:
+                            if tab_id:
+                                await client.delete(f"/tabs/{tab_id}", params={"userId": user_id})
+                        else:
+                            await client.delete(f"/sessions/{user_id}")
+                    except Exception:
+                        pass
 
     def _camofox_snapshot_pending(self, snapshot: str) -> bool:
         return False
+
+    def _camofox_user_id(self) -> str:
+        return f"marketplaces-public-{uuid.uuid4().hex[:12]}"
 
     async def _search_with_camofox(
         self,

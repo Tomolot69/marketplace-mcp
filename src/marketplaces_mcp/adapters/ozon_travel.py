@@ -77,7 +77,10 @@ class OzonTravelAdapter(BaseAdapter):
     camofox_snapshot_attempts = 6
 
     def _camofox_snapshot_pending(self, snapshot: str) -> bool:
-        return "Получаем расписание рейсов" in snapshot
+        if "Получаем расписание рейсов" in snapshot:
+            return True
+        text = _visible_text(snapshot)
+        return "Выберите номер" in text and not _parse_hotel_rates(snapshot, nights=1)
 
     async def search_flights(
         self,
@@ -217,12 +220,21 @@ class OzonTravelAdapter(BaseAdapter):
         )
         offers: list[HotelOffer] = []
         if html:
+            context_verified, context_warnings, _ = _verify_hotel_context(
+                _visible_text(html),
+                parsed_check_in,
+                parsed_check_out,
+                adults,
+                rooms,
+            )
+            warnings.extend(context_warnings)
             offers = self.parse_hotel_results(
                 html,
                 source_url=source_url,
                 destination=destination,
                 check_in=parsed_check_in,
                 check_out=parsed_check_out,
+                context_verified=context_verified,
             )
 
         if offers and include_rates and strategy != "fixture":
@@ -282,14 +294,13 @@ class OzonTravelAdapter(BaseAdapter):
         if validation_warning:
             return None, [validation_warning]
         assert parsed_check_in is not None and parsed_check_out is not None
-        dated_url = _with_query(
+        dated_url = _with_hotel_context_query(
             url,
-            {
-                "checkIn": parsed_check_in.isoformat(),
-                "checkOut": parsed_check_out.isoformat(),
-                "adults": adults,
-                "rooms": rooms,
-            },
+            parsed_check_in,
+            parsed_check_out,
+            adults,
+            rooms,
+            show_all=True,
         )
         html, warnings = await self._load_travel_page(
             dated_url,
@@ -299,13 +310,35 @@ class OzonTravelAdapter(BaseAdapter):
         )
         if not html:
             return None, warnings
+        context_verified, context_warnings, context_evidence = _verify_hotel_context(
+            _visible_text(html),
+            parsed_check_in,
+            parsed_check_out,
+            adults,
+            rooms,
+            allow_single_unit_rate=True,
+        )
+        warnings.extend(context_warnings)
         result = self.parse_hotel_details(
             html,
             url=dated_url,
             destination=destination,
             check_in=parsed_check_in,
             check_out=parsed_check_out,
+            context_verified=context_verified,
+            context_evidence=context_evidence,
         )
+        if (
+            result is not None
+            and result.rates
+            and context_evidence.get("single_unit_rate_context")
+        ):
+            warnings = [
+                warning
+                for warning in warnings
+                if warning != "ROOM_COUNT_UNVERIFIED"
+            ]
+            warnings.append("SINGLE_UNIT_RATE_QUOTE")
         if result is None:
             warnings.append("NO_RESULTS")
         return result, sorted(set(warnings))
@@ -358,18 +391,18 @@ class OzonTravelAdapter(BaseAdapter):
                 base_url = await self._discover_hotel_destination_url(destination)
             if not base_url:
                 base_url = "https://www.ozon.ru/travel/hotels/search-new"
-        return _with_query(
+        return _with_hotel_context_query(
             base_url,
-            {
-                "query": None
+            check_in,
+            check_out,
+            adults,
+            rooms,
+            query=(
+                None
                 if base_url != "https://www.ozon.ru/travel/hotels/search-new"
-                else destination,
-                "checkIn": check_in.isoformat(),
-                "checkOut": check_out.isoformat(),
-                "adults": adults,
-                "rooms": rooms,
-                "sorting": _ozon_hotel_sort(sort),
-            },
+                else destination
+            ),
+            sorting=_ozon_hotel_sort(sort),
         )
 
     def parse_flight_results(
@@ -478,6 +511,7 @@ class OzonTravelAdapter(BaseAdapter):
         destination: str,
         check_in: date,
         check_out: date,
+        context_verified: bool = False,
     ) -> list[HotelOffer]:
         soup = BeautifulSoup(html, "html.parser")
         nights = (check_out - check_in).days
@@ -516,7 +550,9 @@ class OzonTravelAdapter(BaseAdapter):
                 continue
             seen.add(url)
             money = _MONEY_RE.search(text)
-            displayed_price = parse_price(money.group(1)) if money else None
+            displayed_price = (
+                parse_price(money.group(1)) if money and context_verified else None
+            )
             is_total = bool(
                 re.search(
                     r"(?:за\s+\d+\s+ноч|за\s+проживание|итого)", text, re.IGNORECASE
@@ -562,23 +598,32 @@ class OzonTravelAdapter(BaseAdapter):
         destination: str,
         check_in: date,
         check_out: date,
+        context_verified: bool = False,
+        context_evidence: dict[str, Any] | None = None,
     ) -> HotelOffer | None:
         text = _visible_text(html)
+        primary_text = _primary_hotel_text(text)
         title = _first_heading(html) or _title_from_url(url)
         if not title:
             return None
         nights = (check_out - check_in).days
-        rating, reviews = _parse_rating_and_reviews(text)
-        rates = _parse_hotel_rates(text, nights)
+        rating, reviews = _parse_rating_and_reviews(primary_text)
+        rates = _parse_hotel_rates(html, nights) if context_verified else []
         priced_rates = [rate for rate in rates if rate.price is not None]
         total_price = min(
             (rate.price for rate in priced_rates if rate.price is not None),
             default=None,
         )
         nightly_price = total_price / nights if total_price is not None else None
-        address, distance = _parse_hotel_location(text, destination)
-        amenities = [name for name in _AMENITIES if name.lower() in text.lower()]
-        availability = _parse_availability(text, bool(priced_rates))
+        address, distance = _parse_hotel_location(primary_text, destination)
+        amenities = [
+            name for name in _AMENITIES if name.lower() in primary_text.lower()
+        ]
+        availability = (
+            _parse_availability(primary_text, bool(priced_rates))
+            if context_verified
+            else None
+        )
         return HotelOffer(
             title=_clean_title(title),
             url=_canonical_hotel_url(url),
@@ -597,7 +642,10 @@ class OzonTravelAdapter(BaseAdapter):
             rates=rates,
             availability=availability,
             confidence=0.9 if total_price is not None else 0.7,
-            raw={"evidence": text[:3000]},
+            raw={
+                "evidence": primary_text[:3000],
+                "request_context": context_evidence or {},
+            },
         )
 
     async def _load_travel_page(
@@ -1052,7 +1100,8 @@ def _hotel_candidates_from_snapshot(
     return candidates
 
 
-def _parse_hotel_rates(text: str, nights: int) -> list[HotelRate]:
+def _parse_hotel_rates(source: str, nights: int) -> list[HotelRate]:
+    text = source if re.search(r"^\s*- ", source, re.MULTILINE) else _visible_text(source)
     current_hotel_text = re.split(
         r"Похожие\s+(?:отели|гостиницы|варианты)",
         text,
@@ -1063,47 +1112,60 @@ def _parse_hotel_rates(text: str, nights: int) -> list[HotelRate]:
         re.sub(r"\s+", " ", line).strip()
         for line in current_hotel_text.splitlines()
         if line.strip()
-        and not re.search(r"Ближайшие доступные даты", line, re.IGNORECASE)
+        and not re.search(
+            r"Ближайшие доступные даты|Ваши даты|Мало подходящих вариантов",
+            line,
+            re.IGNORECASE,
+        )
     ]
     rates: list[HotelRate] = []
     seen: set[tuple[str | None, float | None]] = set()
+    current_room_name: str | None = None
+    current_room_start = 0
     for index, line in enumerate(lines):
+        candidate = _room_name_candidate(line)
+        if candidate:
+            current_room_name = candidate
+            current_room_start = index
         money = _MONEY_RE.search(line)
-        if not money:
+        if not money or re.match(r"^\s*\+", line):
             continue
         price = parse_price(money.group(1))
-        start = max(0, index - 12)
-        context_start = max(0, index - 1)
-        room_name = None
-        for candidate_index in range(index - 1, start - 1, -1):
-            room_name = _room_name_candidate(lines[candidate_index])
-            if room_name:
-                context_start = candidate_index
-                break
+        # A currency amount outside a named room/rate block is usually a date
+        # carousel, loyalty bonus, or another hotel's teaser. It is not safe to
+        # present it as the requested stay's bookable rate.
+        if current_room_name is None:
+            continue
         end = min(len(lines), index + 5)
         for next_index in range(index + 1, end):
             if _MONEY_RE.search(lines[next_index]):
                 end = next_index
                 break
-        context_lines = lines[context_start:end]
+        context_lines = lines[current_room_start:end]
         context = " ".join(context_lines)
-        key = (room_name, price)
+        key = (current_room_name, price)
         if key in seen:
             continue
         seen.add(key)
         meal = _first_match(
-            context, r"(без питания|завтрак[^.;|]{0,50}|полупансион|полный пансион)"
+            context,
+            r"(без питания|завтрак(?: включён)?|полупансион|полный пансион)",
         )
         cancellation = _first_match(
-            context, r"(бесплатная отмена[^.;|]{0,80}|невозврат[^.;|]{0,80})"
+            context,
+            r"(бесплатная отмена(?:\s+до\s+\d{1,2}\s+[а-яё.]+)?|"
+            r"невозврат(?:ный тариф)?)",
         )
         payment = _first_match(
             context, r"(оплата сейчас|оплата в отеле|без предоплаты)"
         )
-        availability = _first_match(context, r"(остал(?:ся|ось)[^.;|]{0,50}|нет мест)")
+        availability = _first_match(
+            context,
+            r"(остал(?:ся|ось|ись)\s+\d+\s+вариант(?:а|ов)?|нет мест)",
+        )
         rates.append(
             HotelRate(
-                room_name=room_name,
+                room_name=current_room_name,
                 price=price,
                 price_per_night=(price / nights)
                 if price is not None and nights
@@ -1125,22 +1187,35 @@ def _parse_hotel_rates(text: str, nights: int) -> list[HotelRate]:
 def _room_name_candidate(value: str) -> str | None:
     candidate = value.strip().strip('"')
     labelled = re.search(r'(?:heading|img)\s+"([^"\n]+)', candidate, re.IGNORECASE)
+    structurally_named = labelled is not None or bool(
+        re.match(r"^-\s*text:\s*\+\d+\s+", candidate, re.IGNORECASE)
+    )
     if labelled:
         candidate = labelled.group(1).strip()
     else:
         candidate = re.sub(r"^-\s*(?:text:\s*)?", "", candidate).strip()
     candidate = re.sub(r"\s*\[e\d+\](?::)?$", "", candidate).strip(' "')
+    candidate = re.sub(r"^\+\d+\s+", "", candidate).strip()
     if (
-        not 3 <= len(candidate) <= 180
+        not structurally_named
+        or not 3 <= len(candidate) <= 180
         or _MONEY_RE.search(candidate)
         or "/url:" in candidate
         or re.search(
             r"выбрать|подробнее|рейтинг|отзыв|ближайшие даты|ваши даты|"
             r"отмен|оплат|питани|завтрак|\bгост(?:ь|я|ей)|\bноч|\bкомнат|"
-            r"кроват|ванн|кондиционер|wi-fi|вид на|показать|начислим|\bмил|услуг",
+            r"ванн|кондиционер|wi-fi|показать|начислим|\bмил|услуг|"
+            r"\bостал(?:ся|ось|ись)|\bвариант|\bвойти\b|\bрегистрац|"
+            r"\bотель\b|\bгостиниц|нет мест|другой тариф|"
+            r"\b(?:основн|дополнительн)\w*\s+мест",
             candidate,
             re.IGNORECASE,
         )
+        or (
+            not structurally_named
+            and re.search(r"кроват|саун|спальн|ванн", candidate, re.IGNORECASE)
+        )
+        or re.fullmatch(r"[+\-]?\s*[\d\s.,]+", candidate)
         or re.fullmatch(r"(?:-\s*)?img|\[e\d+\]:?", candidate)
     ):
         return None
@@ -1185,6 +1260,12 @@ def _parse_hotel_location(text: str, destination: str) -> tuple[str | None, str 
     distance_match = re.search(
         r"(\d+(?:[.,]\d+)?\s*(?:км|м)\s+до\s+центра)", text, flags=re.IGNORECASE
     )
+    if not distance_match:
+        distance_match = re.search(
+            r"(центр(?:а| города)?\s+\d+(?:[.,]\d+)?\s*(?:км|м))",
+            text,
+            flags=re.IGNORECASE,
+        )
     distance = distance_match.group(1) if distance_match else None
     address_match = re.search(
         rf"({re.escape(destination)}[^•|\n]{{0,180}}?)(?:\s*[•|]|\s+\d+(?:[.,]\d+)?\s*(?:км|м)\s+до\s+центра)",
@@ -1198,9 +1279,26 @@ def _parse_hotel_location(text: str, destination: str) -> tuple[str | None, str 
 def _parse_availability(text: str, has_prices: bool) -> str | None:
     if has_prices:
         return "available"
-    if re.search(r"нет свободных|нет мест|распродано", text, flags=re.IGNORECASE):
+    if re.search(r"нет свободных|нет мест", text, flags=re.IGNORECASE):
+        return "unavailable"
+    sold_out = re.search(r"\bраспродано\b", text, flags=re.IGNORECASE)
+    if sold_out and not re.search(
+        r"почти(?:\s+всё)?\s*$",
+        text[max(0, sold_out.start() - 20) : sold_out.start()],
+        flags=re.IGNORECASE,
+    ):
         return "unavailable"
     return None
+
+
+def _primary_hotel_text(text: str) -> str:
+    return re.split(
+        r"Похожие\s+(?:отели|гостиницы|варианты)|"
+        r"Вам может понравиться|Другие варианты|Отели рядом",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
 
 
 def _first_heading(html: str) -> str | None:
@@ -1231,6 +1329,149 @@ def _canonical_hotel_url(url: str) -> str:
     return urlunsplit(("https", "www.ozon.ru", parsed.path, "", ""))
 
 
+_RU_MONTHS = {
+    1: r"(?:янв\.?|январ(?:я|ь))",
+    2: r"(?:февр\.?|феврал(?:я|ь))",
+    3: r"(?:мар\.?|март(?:а)?)",
+    4: r"(?:апр\.?|апрел(?:я|ь))",
+    5: r"ма(?:я|й)",
+    6: r"июн(?:\.?|я|ь)",
+    7: r"июл(?:\.?|я|ь)",
+    8: r"(?:авг\.?|август(?:а)?)",
+    9: r"(?:сент\.?|сентябр(?:я|ь))",
+    10: r"(?:окт\.?|октябр(?:я|ь))",
+    11: r"(?:нояб\.?|ноябр(?:я|ь))",
+    12: r"(?:дек\.?|декабр(?:я|ь))",
+}
+
+
+def _verify_hotel_context(
+    text: str,
+    check_in: date,
+    check_out: date,
+    adults: int,
+    rooms: int,
+    *,
+    allow_single_unit_rate: bool = False,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    current_hotel_text = re.split(
+        r"Похожие\s+(?:отели|гостиницы|варианты)",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    context = _hotel_context_window(current_hotel_text, check_in, check_out)
+    dates_verified = context is not None
+    context = context or ""
+    guest_counts = {
+        int(value)
+        for value in re.findall(
+            r"(?<!\d)(\d{1,2})\s+гост(?:ь|я|ей)\b",
+            context,
+            re.IGNORECASE,
+        )
+    }
+    room_context = re.sub(
+        r"показать\s+\d{1,2}\s+номер(?:а|ов)?\b",
+        "",
+        context,
+        flags=re.IGNORECASE,
+    )
+    room_counts = {
+        int(value)
+        for value in re.findall(
+            r"(?<!\d)(\d{1,2})\s+номер(?:а|ов)?\b",
+            room_context,
+            re.IGNORECASE,
+        )
+    }
+    guests_verified = adults in guest_counts
+    rooms_verified = rooms in room_counts
+    warnings: list[str] = []
+    if not dates_verified:
+        warnings.append("DATE_AVAILABILITY_UNVERIFIED")
+    if not guests_verified:
+        warnings.append("GUEST_COUNT_UNVERIFIED")
+    if not rooms_verified:
+        warnings.append("ROOM_COUNT_UNVERIFIED")
+    single_unit_rate_context = (
+        allow_single_unit_rate
+        and rooms == 1
+        and dates_verified
+        and guests_verified
+        and not rooms_verified
+    )
+    verified = dates_verified and guests_verified and (
+        rooms_verified or single_unit_rate_context
+    )
+    if not verified:
+        warnings.append("PRICE_UNVERIFIED")
+    return (
+        verified,
+        warnings,
+        {
+            "dates_verified": dates_verified,
+            "guest_count_verified": guests_verified,
+            "room_count_verified": rooms_verified,
+            "single_unit_rate_context": single_unit_rate_context,
+            "rendered_guest_counts": sorted(guest_counts),
+            "rendered_room_counts": sorted(room_counts),
+            "requested_check_in": check_in.isoformat(),
+            "requested_check_out": check_out.isoformat(),
+            "requested_adults": adults,
+            "requested_rooms": rooms,
+        },
+    )
+
+
+def _hotel_context_window(text: str, check_in: date, check_out: date) -> str | None:
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    candidates: list[tuple[int, str]] = []
+    for width in range(1, min(5, len(lines)) + 1):
+        for start in range(0, len(lines) - width + 1):
+            date_block = " ".join(lines[start : start + width])
+            if not _hotel_dates_match(date_block, check_in, check_out):
+                continue
+            nearby = " ".join(
+                lines[max(0, start - 3) : min(len(lines), start + width + 4)]
+            )
+            score = 2 if re.search(r"ваши даты", date_block, re.IGNORECASE) else 0
+            score += 5 * int(
+                bool(re.search(r"\d+\s+гост", nearby, re.IGNORECASE))
+            )
+            score += int(bool(re.search(r"\d+\s+номер", nearby, re.IGNORECASE)))
+            candidates.append((score, nearby))
+        if candidates:
+            break
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _hotel_dates_match(text: str, check_in: date, check_out: date) -> bool:
+    if check_in.isoformat() in text and check_out.isoformat() in text:
+        return True
+    numeric_in = rf"(?<!\d)0?{check_in.day}[./-]0?{check_in.month}(?:[./-]{check_in.year})?(?!\d)"
+    numeric_out = rf"(?<!\d)0?{check_out.day}[./-]0?{check_out.month}(?:[./-]{check_out.year})?(?!\d)"
+    if re.search(numeric_in, text) and re.search(numeric_out, text):
+        return True
+    if check_in.month == check_out.month:
+        month = _RU_MONTHS[check_in.month]
+        same_month_range = re.compile(
+            rf"(?<!\d){check_in.day}\s*[—–-]\s*{check_out.day}\s+{month}(?=\s|[,—–-]|$)",
+            re.IGNORECASE,
+        )
+        if same_month_range.search(text):
+            return True
+    first = rf"(?<!\d){check_in.day}\s+{_RU_MONTHS[check_in.month]}(?=\s|[,—–-]|$)"
+    second = rf"(?<!\d){check_out.day}\s+{_RU_MONTHS[check_out.month]}(?=\s|[,—–-]|$)"
+    return bool(
+        re.search(first, text, re.IGNORECASE)
+        and re.search(second, text, re.IGNORECASE)
+    )
+
+
 def _is_ozon_hotel_url(value: str) -> bool:
     parsed = urlsplit(value)
     host = (parsed.hostname or "").lower()
@@ -1256,6 +1497,60 @@ def _with_query(url: str, values: dict[str, object | None]) -> str:
             query[key] = str(value)
     return urlunsplit(
         (parsed.scheme or "https", parsed.netloc, parsed.path, urlencode(query), "")
+    )
+
+
+def _with_hotel_context_query(
+    url: str,
+    check_in: date,
+    check_out: date,
+    adults: int,
+    rooms: int,
+    *,
+    query: str | None = None,
+    sorting: str | None = None,
+    show_all: bool | None = None,
+) -> str:
+    parsed = urlsplit(url)
+    replaced = {
+        "checkin",
+        "checkout",
+        "checkindate",
+        "checkoutdate",
+        "adult",
+        "adults",
+        "dlts",
+        "rooms",
+        "room",
+        "roomcount",
+        "guests",
+        "guestcount",
+        "showall",
+    }
+    existing = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if re.sub(r"[^a-z]", "", key.lower()) not in replaced
+    ]
+    values: list[tuple[str, str]] = existing
+    if query is not None:
+        values = [(key, value) for key, value in values if key.lower() != "query"]
+        values.append(("query", query))
+    if sorting is not None:
+        values = [(key, value) for key, value in values if key.lower() != "sorting"]
+        values.append(("sorting", sorting))
+    if show_all is not None:
+        values.append(("showAll", str(show_all).lower()))
+    values.extend(
+        [
+            ("checkIn", check_in.isoformat()),
+            ("checkOut", check_out.isoformat()),
+            ("Dlts", str(adults)),
+            ("rooms", str(rooms)),
+        ]
+    )
+    return urlunsplit(
+        (parsed.scheme or "https", parsed.netloc, parsed.path, urlencode(values), "")
     )
 
 

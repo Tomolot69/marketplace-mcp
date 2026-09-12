@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 from marketplaces_mcp.adapters.base import BaseAdapter
 from marketplaces_mcp.core.models import ProductResult
 from marketplaces_mcp.core.normalize import parse_price
+from marketplaces_mcp.core.price_evidence import price_metadata, primary_html_text
 
 
 class WildberriesAdapter(BaseAdapter):
@@ -101,6 +102,12 @@ class WildberriesAdapter(BaseAdapter):
         return None, ["WILDBERRIES_API_NO_RESULTS"]
 
     async def _fetch_wildberries_api(self, url: str) -> dict[str, Any] | None:
+        try:
+            return await self._request_wildberries_api(url)
+        except (httpx.HTTPError, ValueError):
+            return None
+
+    async def _request_wildberries_api(self, url: str) -> dict[str, Any] | None:
         async with httpx.AsyncClient(
             headers=self._wildberries_api_headers(),
             timeout=self.settings.request_timeout,
@@ -157,6 +164,7 @@ class WildberriesAdapter(BaseAdapter):
                     title=title,
                     url=url,
                     price=price,
+                    **price_metadata(text, price),
                     currency="RUB",
                     image_url=image,
                     availability="available" if re.search(r"\b(?:В корзину|Купить)\b", text, re.I) else None,
@@ -174,7 +182,7 @@ class WildberriesAdapter(BaseAdapter):
             title = str(meta.get("content") or "").strip() if meta else ""
         if not title:
             return None
-        body = soup.get_text(" ", strip=True)
+        body = primary_html_text(soup)
         image = None
         image_meta = soup.select_one("meta[property='og:image']")
         if image_meta:
@@ -185,6 +193,7 @@ class WildberriesAdapter(BaseAdapter):
             title=title,
             url=self.normalize_product_url(url),
             price=price,
+            **price_metadata(body, price),
             currency="RUB",
             image_url=image if isinstance(image, str) else None,
             availability="available" if re.search(r"\b(?:В корзину|Купить)\b", body, re.I) else None,
@@ -243,10 +252,11 @@ def _api_product_to_result(
         currency="RUB",
         rating=_as_float(item.get("reviewRating") or item.get("rating")),
         reviews_count=_as_int(item.get("feedbacks") or item.get("nmFeedbacks")),
-        availability="available" if total_quantity is None or total_quantity > 0 else "out_of_stock",
-        seller=str(item.get("brand") or "").strip() or None,
+        availability=("available" if total_quantity > 0 else "out_of_stock") if total_quantity is not None else None,
+        seller=str(item.get("supplier") or "").strip() or None,
         confidence=0.95 if price is not None else 0.8,
-        raw=raw,
+        raw={**raw, "brand": item.get("brand"), "region_id": -1257786,
+             "price_scope": "Displayed API variant price; wallet discount and delivery unverified"},
     )
 
 
