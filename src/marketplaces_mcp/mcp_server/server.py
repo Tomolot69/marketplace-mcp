@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date
+from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP
 
@@ -8,9 +10,13 @@ from marketplaces_mcp.adapters import (
     AvitoAdapter,
     OzonAdapter,
     OzonTravelAdapter,
+    PackageToursAdapter,
     WildberriesAdapter,
     YandexMarketAdapter,
 )
+from marketplaces_mcp.core.ozon_tours_access import OzonToursAccess
+from marketplaces_mcp.core.ozon_tours_browser import OzonToursBrowser
+from marketplaces_mcp.adapters.ozon_tours import OzonToursAdapter
 from marketplaces_mcp.core.artifacts import create_artifact, read_artifact
 from marketplaces_mcp.core.config import get_settings
 from marketplaces_mcp.core.matching import group_product_results
@@ -22,8 +28,11 @@ from marketplaces_mcp.core.models import (
     ProductResult,
     ReviewsResponse,
     SearchResponse,
+    TourSearchResponse,
 )
 from marketplaces_mcp.core.reviews import fetch_reviews
+from marketplaces_mcp.core.game_search import search_game_offers
+from marketplaces_mcp.core.price_evidence import is_public_price, price_sort_key
 
 REQUIRED_TOOLS = [
     "marketplaces_search",
@@ -31,6 +40,8 @@ REQUIRED_TOOLS = [
     "wildberries_search",
     "yandex_market_search",
     "avito_search",
+    "avito_game_search",
+    "avito_access_status",
     "marketplaces_compare",
     "marketplaces_product_details",
     "marketplaces_product_reviews",
@@ -38,6 +49,10 @@ REQUIRED_TOOLS = [
     "ozon_travel_flights_search",
     "ozon_travel_hotels_search",
     "ozon_travel_hotel_details",
+    "package_tours_search",
+    "ozon_tours_access_status",
+    "ozon_travel_tours_search",
+    "ozon_travel_tour_details",
 ]
 
 
@@ -51,6 +66,77 @@ _adapters = {
 }
 _default_marketplaces = ["ozon", "wildberries", "yandex_market"]
 _travel_adapter = OzonTravelAdapter(_settings)
+_package_tours_adapter = PackageToursAdapter()
+
+
+_tours_browser = OzonToursBrowser(_settings.camofox_url)
+_tours_access = OzonToursAccess(_tours_browser)
+_ozon_package_adapter = OzonToursAdapter(_tours_browser, _tours_access)
+
+
+@mcp.tool()
+async def ozon_tours_access_status(probe: bool = False, inspect_tab: bool = False):
+    """Read last Ozon tours access evidence. By default makes no site requests.
+
+    probe=True permits one normal browser check only when the shared 30-minute
+    cooldown allows it. inspect_tab=True only reads the retained browser tab,
+    even during cooldown: use after manual CAPTCHA completion without navigating.
+    Availability never implies package search support.
+    """
+    return await _tours_access.status(probe=probe, inspect_tab=inspect_tab)
+
+
+
+@mcp.tool()
+async def ozon_travel_tours_search(
+    origin: str = "LED", destination: str = "ОАЭ", departure_date: str = "",
+    min_nights: int = 5, max_nights: int = 9, adults: int = 2,
+    child_ages: list[int] | None = None, rooms: int = 1,
+    all_inclusive_only: bool = True, limit: int = 10,
+):
+    """Search actual Ozon package tours in the retained desktop Camofox browser.
+
+    Currently verified LED to UAE, one room. Include infant age 0 in child_ages.
+    One exact departure date and at most five stay lengths (5–9 then 10–12).
+    Returns hotel leads, never treats search-card prices as matching meal prices.
+    Call ozon_travel_tour_details for serious candidates. No booking or payment.
+    """
+    return await asyncio.wait_for(_ozon_package_adapter.search(
+        origin=origin, destination=destination, departure_date=departure_date,
+        min_nights=min_nights, max_nights=max_nights, adults=adults,
+        child_ages=child_ages, rooms=rooms, all_inclusive_only=all_inclusive_only, limit=limit,
+    ), timeout=150)
+
+
+@mcp.tool()
+async def ozon_travel_tour_details(search_url: str, hotel_name: str,
+                                   all_inclusive_only: bool = True, limit: int = 20):
+    """Read exact Ozon room/meal/operator package quotes for a current search lead.
+
+    Pass source_url and exact hotel_name from ozon_travel_tours_search. Opens only
+    room selection, stops before selecting a flight, reservation or payment.
+    Room-page meal filters are checked independently: Ozon search-card prices
+    can reflect breakfast even when all-inclusive was selected.
+    """
+    return await asyncio.wait_for(_ozon_package_adapter.details(
+        search_url=search_url, hotel_name=hotel_name,
+        all_inclusive_only=all_inclusive_only, limit=limit,
+    ), timeout=110)
+
+
+async def _safe_search(adapter, **kwargs):
+    kwargs["limit"] = max(1, min(int(kwargs.get("limit", 10)), 30))
+    try:
+        return await asyncio.wait_for(adapter.search(**kwargs), 150)
+    except Exception as exc:
+        return [], [f"{adapter.marketplace.upper()}_SEARCH_FAILED_{type(exc).__name__}"], adapter.build_search_url(kwargs["query"])
+
+
+async def _safe_details(adapter, **kwargs):
+    try:
+        return await asyncio.wait_for(adapter.product_details(**kwargs), 150)
+    except Exception as exc:
+        return None, [f"{adapter.marketplace.upper()}_DETAILS_FAILED_{type(exc).__name__}"], kwargs["url"]
 
 
 def _as_marketplace_list(raw: list[str] | None) -> list[str]:
@@ -77,7 +163,7 @@ async def marketplaces_search(
 
     for key in marketplaces:
         adapter = _adapters[key]
-        results, adapter_warnings, search_url = await adapter.search(
+        results, adapter_warnings, search_url = await _safe_search(adapter,
             query=query,
             limit=limit,
             strategy=strategy,
@@ -86,7 +172,7 @@ async def marketplaces_search(
         used_urls.append(search_url)
         all_results.extend(results)
 
-    all_results.sort(key=lambda item: (item.price is None, item.price or 0.0))
+    all_results.sort(key=price_sort_key)
     all_results = all_results[:limit]
 
     response = SearchResponse(
@@ -112,7 +198,7 @@ async def marketplaces_search(
 
 @mcp.tool()
 async def ozon_search(query: str, limit: int = 10, strategy: str = "auto"):
-    results, warnings, search_url = await _adapters["ozon"].search(
+    results, warnings, search_url = await _safe_search(_adapters["ozon"],
         query=query, limit=limit, strategy=strategy
     )
     response = SearchResponse(
@@ -136,7 +222,7 @@ async def ozon_search(query: str, limit: int = 10, strategy: str = "auto"):
 
 @mcp.tool()
 async def wildberries_search(query: str, limit: int = 10, strategy: str = "auto"):
-    results, warnings, search_url = await _adapters["wildberries"].search(
+    results, warnings, search_url = await _safe_search(_adapters["wildberries"],
         query=query,
         limit=limit,
         strategy=strategy,
@@ -162,7 +248,7 @@ async def wildberries_search(query: str, limit: int = 10, strategy: str = "auto"
 
 @mcp.tool()
 async def yandex_market_search(query: str, limit: int = 10, strategy: str = "auto"):
-    results, warnings, search_url = await _adapters["yandex_market"].search(
+    results, warnings, search_url = await _safe_search(_adapters["yandex_market"],
         query=query,
         limit=limit,
         strategy=strategy,
@@ -188,7 +274,7 @@ async def yandex_market_search(query: str, limit: int = 10, strategy: str = "aut
 
 @mcp.tool()
 async def avito_search(query: str, limit: int = 10, strategy: str = "auto"):
-    results, warnings, search_url = await _adapters["avito"].search(
+    results, warnings, search_url = await _safe_search(_adapters["avito"],
         query=query,
         limit=limit,
         strategy=strategy,
@@ -210,6 +296,30 @@ async def avito_search(query: str, limit: int = 10, strategy: str = "auto"):
         }
     )
     return response
+
+
+@mcp.tool()
+async def avito_access_status():
+    """Read Avito block reason and earliest retry time. No browser or index requests.
+
+    A ready state permits a single normal probe; it never proves access or price.
+    """
+    return await _adapters["avito"].access_status()
+
+
+@mcp.tool()
+async def avito_game_search(game_title: str, max_price: float | None = None,
+                           include_game_key_cards: bool = True, limit: int = 8,
+                           verify_details: int = 2, strategy: str = "auto"):
+    """Find Switch 2 physical games; separate cartridges from Game-Key Cards.
+
+    Only eligible_offers have a matching title and verified live detail price.
+    Digital codes, accounts, ambiguous lots and indexed prices cannot qualify.
+    Stop on Avito cooldown. At most two detail reads, no purchases or messages.
+    """
+    return await search_game_offers(_adapters["avito"], game_title, max_price=max_price,
+        include_game_key_cards=include_game_key_cards, limit=limit,
+        verify_details=verify_details, strategy=strategy)
 
 
 @mcp.tool()
@@ -392,6 +502,93 @@ async def ozon_travel_hotel_details(
 
 
 @mcp.tool()
+async def package_tours_search(
+    origin: str,
+    destination: str,
+    departure_date_from: str,
+    departure_date_to: str,
+    min_nights: int = 5,
+    max_nights: int = 12,
+    adults: int = 2,
+    children: int = 0,
+    infants: int = 0,
+    child_ages: list[int] | None = None,
+    infant_ages: list[int] | None = None,
+    rooms: int = 1,
+    all_inclusive_only: bool = False,
+    stars: list[int] | None = None,
+    sort: str = "value",
+    limit: int = 30,
+):
+    """Search independent 1001tur flight+hotel quotes, never Ozon prices.
+
+    Requires exact returned dates, party, ages, meals, and included airfare.
+    One room only. Infants default to age 0; specify infant_ages for age 1.
+    Results cover a partial supplier snapshot and need price reconfirmation.
+    This tool does not query Ozon or diagnose its availability.
+    """
+    results, warnings, source_url = await _package_tours_adapter.search(
+        origin=origin,
+        destination=destination,
+        departure_date_from=departure_date_from,
+        departure_date_to=departure_date_to,
+        min_nights=min_nights,
+        max_nights=max_nights,
+        adults=adults,
+        children=children,
+        infants=infants,
+        child_ages=child_ages or [],
+        infant_ages=([0] * infants if infant_ages is None else infant_ages),
+        rooms=rooms,
+        all_inclusive_only=all_inclusive_only,
+        stars=stars,
+        sort=sort,
+        limit=limit,
+    )
+    response = TourSearchResponse(
+        origin=origin,
+        destination=destination,
+        departure_date_from=date.fromisoformat(departure_date_from),
+        departure_date_to=date.fromisoformat(departure_date_to),
+        min_nights=min_nights,
+        max_nights=max_nights,
+        adults=adults,
+        children=children,
+        infants=infants,
+        child_ages=child_ages or [],
+        infant_ages=([0] * infants if infant_ages is None else infant_ages),
+        rooms=rooms,
+        meal_plan="all_inclusive" if all_inclusive_only else None,
+        results=results,
+        warnings=warnings,
+        source_url=source_url,
+    )
+    response.artifact_id = create_artifact(
+        {
+            "type": "package_tours_search",
+            "requested_provider": "1001tur",
+            "origin": origin,
+            "destination": destination,
+            "departure_date_from": departure_date_from,
+            "departure_date_to": departure_date_to,
+            "min_nights": min_nights,
+            "max_nights": max_nights,
+            "passengers": {"adults": adults, "children": children, "infants": infants},
+            "child_ages": child_ages or [],
+            "infant_ages": [0] * infants if infant_ages is None else infant_ages,
+            "rooms": rooms,
+            "all_inclusive_only": all_inclusive_only,
+            "stars": stars,
+            "sort": sort,
+            "source_url": source_url,
+            "warnings": warnings,
+            "results": [item.model_dump(mode="json") for item in results],
+        }
+    )
+    return response
+
+
+@mcp.tool()
 async def marketplaces_compare(
     query: str,
     limit_per_marketplace: int = 10,
@@ -406,7 +603,7 @@ async def marketplaces_compare(
         adapter_keys.append("avito")
     for key in adapter_keys:
         adapter = _adapters[key]
-        results, adapter_warnings, search_url = await adapter.search(
+        results, adapter_warnings, search_url = await _safe_search(adapter,
             query=query,
             limit=limit_per_marketplace,
             strategy=strategy,
@@ -422,7 +619,7 @@ async def marketplaces_compare(
     for index, group in enumerate(groups_internal, start=1):
         offers = sorted(
             group.offers,
-            key=lambda item: (item.price is None, item.price or 0.0),
+            key=price_sort_key,
         )
         groups_for_response.append(
             OfferGroup(
@@ -434,8 +631,12 @@ async def marketplaces_compare(
         if group.confidence < 0.35 and len(group.offers) > 1:
             low_confidence_warnings.append(f"LOW_CONFIDENCE_GROUP_{index}")
 
-    best_offers = [group.offers[0] for group in groups_for_response if group.offers]
-    best_offers.sort(key=lambda item: (item.price is None, item.price or 0.0))
+    best_offers = [next((offer for offer in group.offers if is_public_price(offer)), None)
+                   for group in groups_for_response]
+    best_offers = [offer for offer in best_offers if offer is not None]
+    best_offers.sort(key=price_sort_key)
+    if any(not is_public_price(offer) for offer in all_results):
+        warnings.append("NON_PUBLIC_PRICES_EXCLUDED_FROM_BEST_OFFERS")
 
     response = CompareResponse(
         query=query,
@@ -479,7 +680,7 @@ async def marketplaces_product_details(url: str, strategy: str = "auto"):
         return response
 
     adapter = _adapters[marketplace]
-    product, warnings, _ = await adapter.product_details(url=url, strategy=strategy)
+    product, warnings, _ = await _safe_details(adapter, url=url, strategy=strategy)
     response = SearchResponse(
         query=url,
         marketplaces=[marketplace],
@@ -507,11 +708,12 @@ async def marketplaces_product_reviews(url: str, limit: int = 20):
             marketplace="unknown",
             warnings=["UNKNOWN_MARKETPLACE"],
         )
-    reviews, warnings, review_url, total, rating = await fetch_reviews(
-        _adapters[marketplace],
-        url,
-        max(1, min(limit, 30)),
-    )
+    try:
+        reviews, warnings, review_url, total, rating = await asyncio.wait_for(
+            fetch_reviews(_adapters[marketplace], url, max(1, min(limit, 30))), 150)
+    except Exception as exc:
+        return ReviewsResponse(url=url, marketplace=marketplace,
+                               warnings=[f"REVIEWS_FAILED_{type(exc).__name__}"])
     response = ReviewsResponse(
         url=review_url,
         marketplace=marketplace,
@@ -540,16 +742,16 @@ async def marketplaces_get_artifact(artifact_id: str, name: str = "content.json"
 
 
 def _detect_marketplace(url: str) -> str:
-    lower = url.lower()
-    if "ozon.ru" in lower:
-        return "ozon"
-    if "wildberries.ru" in lower:
-        return "wildberries"
-    if "market.yandex.ru" in lower or "yandex" in lower:
-        return "yandex_market"
-    if "avito.ru" in lower:
-        return "avito"
-    return "unknown"
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in {None, 443}:
+            return "unknown"
+        return {"ozon.ru": "ozon", "www.ozon.ru": "ozon",
+                "wildberries.ru": "wildberries", "www.wildberries.ru": "wildberries",
+                "market.yandex.ru": "yandex_market", "avito.ru": "avito",
+                "www.avito.ru": "avito"}.get(parsed.hostname, "unknown")
+    except ValueError:
+        return "unknown"
 
 
 def _estimate_tokens(query: str, results_count: int) -> int:
