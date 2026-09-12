@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ProductResult(BaseModel):
@@ -11,6 +11,9 @@ class ProductResult(BaseModel):
     title: str
     url: str
     price: float | None = None
+    price_kind: str = "unknown"
+    price_condition: str | None = None
+    game_offer: dict[str, Any] | None = None
     old_price: float | None = None
     currency: str = Field(default="RUB")
     rating: float | None = None
@@ -31,6 +34,22 @@ class ProductResult(BaseModel):
     scraped_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     confidence: float | None = None
     raw: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def classify_game_media(self):
+        import re
+        if self.game_offer is None and re.search(r"switch|свитч|свич|\bns2\b", self.title, re.I):
+            from marketplaces_mcp.core.game_offers import classify_game_offer
+            raw = self.raw or {}
+            self.game_offer = classify_game_offer(
+                self.title, raw.get("description") or raw.get("card_text"), self.price,
+            ).model_dump()
+        if self.game_offer and self.price_kind != "exact":
+            self.game_offer["price_kind"] = "from_price" if self.price_kind == "from" else "unknown"
+            if self.price_condition:
+                self.game_offer["price_condition"] = self.price_condition
+            self.game_offer["alert_eligible"] = False
+        return self
 
 
 class SearchResponse(BaseModel):
@@ -170,6 +189,63 @@ class HotelSearchResponse(BaseModel):
     adults: int = 2
     rooms: int = 1
     results: list[HotelOffer] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    source_url: str
+    artifact_id: str | None = None
+
+
+class TourOffer(BaseModel):
+    checked_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    price_status: str = "live_quote_not_final_booking"
+    rooms: int = 1
+    provider: str
+    url: str
+    hotel_name: str
+    destination: str
+    departure_from: str
+    departure_date: date
+    return_date: date | None = None
+    nights: int
+    total_price: float
+    price_per_night: float
+    currency: str = "RUB"
+    stars: int | None = None
+    rating: float | None = None
+    reviews_count: int | None = None
+    meal_plan: str | None = None
+    room: str | None = None
+    adults: int = 2
+    children: int = 0
+    infants: int = 0
+    operator_name: str | None = None
+    beach_line: str | None = None
+    beach_distance_m: int | None = None
+    beach_type: str | None = None
+    flight_included: bool | None = None
+    transfer_included: bool | None = None
+    baggage: str | None = None
+    availability: str | None = None
+    image_url: str | None = None
+    confidence: float = 0.8
+    raw: dict[str, Any] | None = None
+
+
+class TourSearchResponse(BaseModel):
+    child_ages: list[int] = Field(default_factory=list)
+    infant_ages: list[int] = Field(default_factory=list)
+    rooms: int = 1
+    requested_provider: str = "1001tur"
+    origin: str
+    destination: str
+    departure_date_from: date
+    departure_date_to: date
+    min_nights: int
+    max_nights: int
+    adults: int
+    children: int = 0
+    infants: int = 0
+    meal_plan: str | None = None
+    results: list[TourOffer] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     source_url: str
     artifact_id: str | None = None
