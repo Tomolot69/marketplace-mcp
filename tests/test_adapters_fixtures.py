@@ -383,7 +383,8 @@ def test_ozon_details_uses_search_fallback_after_blocked_product_page(monkeypatc
     assert product.url == product_url
     assert product.raw is not None
     assert product.raw["source"] == "ozon_search_result_fallback"
-    assert "CAPTCHA_OR_BLOCKED" in warnings
+    assert "HIVE_WEB_BLOCKED" in warnings
+    assert "CAPTCHA_OR_BLOCKED" not in warnings
     assert "OZON_DETAILS_SEARCH_FALLBACK" in warnings
     assert calls == [product_url, "https://www.ozon.ru/search/?text=7969279"]
 
@@ -522,7 +523,8 @@ def test_yandex_details_uses_http_search_fallback_after_blocked_card(monkeypatch
     assert product.url == product_url
     assert product.raw is not None
     assert product.raw["source"] == "yandex_search_result_fallback"
-    assert "CAPTCHA_OR_BLOCKED" in warnings
+    assert "HIVE_WEB_BLOCKED" in warnings
+    assert "CAPTCHA_OR_BLOCKED" not in warnings
     assert "YANDEX_DETAILS_SEARCH_FALLBACK" in warnings
     assert http_urls == ["https://market.yandex.ru/search?text=5694381852&local-offers-first=0"]
 
@@ -640,7 +642,7 @@ def test_ozon_camofox_snapshot_parsing():
     results = OzonAdapter().parse_search_results(OZON_CAMOFOX_SNAPSHOT, query="наматрасник")
     assert len(results) == 1
     assert results[0].price == 374.0
-    assert results[0].old_price == 999.0
+    assert results[0].old_price is None  # An unlabeled second amount is not proof of an old price.
     assert results[0].rating == 5.0
     assert results[0].reviews_count == 462
     assert results[0].availability == "344 шт осталось"
