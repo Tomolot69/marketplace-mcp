@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -11,6 +12,12 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_TOOLS = {
     "avito_search",
+    "avito_game_search",
+    "avito_access_status",
+    "ozon_tours_access_status",
+    "ozon_travel_tours_search",
+    "ozon_travel_tour_details",
+    "package_tours_search",
     "marketplaces_search",
     "ozon_search",
     "wildberries_search",
@@ -63,8 +70,8 @@ async def main() -> None:
         env["MARKETPLACES_FIXTURES_DIR"] = str(fixture_dir)
 
         params = StdioServerParameters(
-            command="uv",
-            args=["run", "--project", str(ROOT), "marketplaces-mcp"],
+            command=sys.executable,
+            args=["-m", "marketplaces_mcp"],
             env=env,
         )
         async with stdio_client(params) as (read, write):
@@ -98,6 +105,10 @@ async def main() -> None:
                         "strategy": "fixture",
                     },
                 )
+                access_result = await session.call_tool("ozon_tours_access_status", {})
+                assert not access_result.isError
+                assert json.loads(access_result.content[0].text)["search_supported"] is True
+                assert not any(result.isError for result in (result, flight_result, hotel_result))
                 print(
                     json.dumps(
                         {
