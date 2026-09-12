@@ -39,6 +39,35 @@ the displayed total price. Hotel results deliberately keep `nightly_price` and
 as the exact total for the requested stay; use hotel details/rates when an exact
 dated total is required.
 
+## Package tours and access diagnostics
+
+- `ozon_travel_tours_search` discovers Ozon package-tour hotel candidates.
+- `ozon_travel_tour_details` reads dated room, meal-plan, operator and package-price evidence for a candidate from the same browser search.
+- `ozon_tours_access_status` reads cached access state by default; `inspect_tab=true` inspects the retained page without navigating, and explicit probes respect shared cooldown.
+- `package_tours_search` is a separate 1001tur source, never an Ozon quote.
+- `avito_access_status` reports shared Avito access/cooldown state.
+- `avito_game_search` distinguishes physical cartridges, Game-Key Cards and excluded digital/account listings.
+
+The verified Ozon package scope is Saint Petersburg (`LED`) to UAE, one room,
+exact departure date, 1–6 adults and up to three children aged 0–16. Age 0 means
+an infant under one year. Request 2–21 nights with at most five stay lengths
+per call, for example 5–9 and 10–12.
+
+Search-card prices can belong to breakfast even when all-inclusive filters are
+selected. Package search therefore returns `total_price=null`; use details to
+read each room/meal/operator row. A package rate marked as including flights
+still has `flight_selection_pending=true`: specific flights, baggage, transfer,
+return-flight date and final booking total remain unconfirmed. `stay_end_date`
+is the hotel checkout date, not proof of the return-flight date.
+
+Ozon package tools require Camofox at `MARKETPLACES_CAMOFOX_URL`. Use a working
+display (the supported `CAMOFOX_INTERACTIVE=desktop` mode was verified) and keep
+tab/session inactivity timeouts long enough for a search and details workflow
+(30 minutes was tested). Browser deployment must preserve a replacement session
+when an older context finishes closing. A navigation timeout retains the tab;
+visible CAPTCHA/block pages are reported for manual inspection rather than retried
+with rotating profiles or addresses. No login, booking or payment is automated.
+
 ## Safety model
 
 Marketplace MCP is deliberately read-only.
